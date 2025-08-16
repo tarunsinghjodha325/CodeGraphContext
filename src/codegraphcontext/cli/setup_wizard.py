@@ -133,7 +133,11 @@ def find_latest_neo4j_creds_file():
 
 def setup_hosted_db():
     """Guides user to configure a remote Neo4j instance."""
+    console.print("\nTo connect to a hosted Neo4j database, you'll need your connection credentials.")
+    console.print("If you don't have a hosted database, you can create a free one at [bold blue]https://neo4j.com/product/auradb/[/bold blue] (click 'Start free').")
+    
     questions = [
+
         {
             "type": "list",
             "message": "How would you like to add your Neo4j credentials?",
