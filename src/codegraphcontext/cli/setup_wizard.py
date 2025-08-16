@@ -5,12 +5,63 @@ import platform
 import os
 from pathlib import Path
 import time
+import json
+import sys
+import shutil
 
 console = Console()
 
+def _generate_mcp_json(creds):
+    """Generates and prints the MCP JSON configuration."""
+    cgc_path = shutil.which("cgc") or sys.executable
+
+    if "python" in Path(cgc_path).name:  
+        # fallback to running as module if no cgc binary is found
+        command = cgc_path
+        args = ["-m", "cgc", "start"]
+    else:
+        command = cgc_path
+        args = ["start"]
+
+    mcp_config = {
+        "mcpServers": {
+            "CodeGraphContext": {
+                "command": command,
+                "args": args,
+                "env": {
+                    "NEO4J_URI": creds.get("uri", ""),
+                    "NEO4J_USER": creds.get("username", "neo4j"),
+                    "NEO4J_PASSWORD": creds.get("password", "")
+                },
+                "tools": {
+                    "alwaysAllow": [
+                        "list_imports", "add_code_to_graph", "add_package_to_graph",
+                        "check_job_status", "list_jobs", "find_code",
+                        "analyze_code_relationships", "watch_directory",
+                        "find_dead_code", "execute_cypher_query"
+                    ],
+                    "disabled": False
+                },
+                "disabled": False,
+                "alwaysAllow": []
+            }
+        }
+    }
+    
+    console.print("\n[bold green]Configuration successful![/bold green]")
+    console.print("Copy the following JSON and add it to your MCP server configuration file:")
+    console.print(json.dumps(mcp_config, indent=2))
+    
+    # Also save to a file for convenience
+    mcp_file = Path.cwd() / "mcp.json"
+    with open(mcp_file, "w") as f:
+        json.dump(mcp_config, f, indent=2)
+    console.print(f"\n[cyan]For your convenience, the configuration has also been saved to: {mcp_file}[/cyan]")
+
+
 def get_project_root() -> Path:
-    """Returns the project root directory."""
-    return Path(__file__).resolve().parent.parent.parent.parent
+    """Always return the directory where the user runs `cgc` (CWD)."""
+    return Path.cwd()
 
 def run_command(command, console, shell=False, check=True, input_text=None):
     """
@@ -78,31 +129,7 @@ def find_latest_neo4j_creds_file():
     latest_file = max(cred_files, key=lambda f: f.stat().st_mtime)
     return latest_file
 
-def parse_creds_file(file_path: Path):
-    """Parses a credentials file and writes to .env."""
-    try:
-        creds = {}
-        with open(file_path, "r") as f:
-            for line in f:
-                if "=" in line:
-                    key, value = line.strip().split("=", 1)
-                    if key in ["NEO4J_URI", "NEO4J_USERNAME", "NEO4J_PASSWORD"]:
-                        creds[key] = value
-        
-        if all(k in creds for k in ["NEO4J_URI", "NEO4J_USERNAME", "NEO4J_PASSWORD"]):
-            env_path = get_project_root() / ".env"
-            with open(env_path, "w") as f:
-                f.write(f"NEO4J_URI={creds['NEO4J_URI']}\n")
-                f.write(f"NEO4J_USERNAME={creds['NEO4J_USERNAME']}\n")
-                f.write(f"NEO4J_PASSWORD={creds['NEO4J_PASSWORD']}\n")
-            console.print(f"[green]✅ Configuration from {file_path.name} saved to .env file in project root.[/green]")
-            return True
-        else:
-            console.print("[red]❌ The credentials file is missing one or more required keys (NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD).[/red]")
-            return False
-    except Exception as e:
-        console.print(f"[red]❌ Failed to parse credentials file: {e}[/red]")
-        return False
+
 
 def setup_hosted_db():
     """Guides user to configure a remote Neo4j instance."""
@@ -117,8 +144,10 @@ def setup_hosted_db():
     result = prompt(questions)
     cred_method = result.get("cred_method")
 
+    creds = {}
     if cred_method and "file" in cred_method:
         latest_file = find_latest_neo4j_creds_file()
+        file_to_parse = None
         if latest_file:
             confirm_questions = [
                 {
@@ -129,38 +158,51 @@ def setup_hosted_db():
                 }
             ]
             if prompt(confirm_questions).get("use_latest"):
-                if parse_creds_file(latest_file):
-                    return
+                file_to_parse = latest_file
 
-        # If no file was found, or the user chose not to use the found file
-        path_questions = [
-            {"type": "input", "message": "Please enter the path to your credentials file:", "name": "cred_file_path"}
-        ]
-        file_path_str = prompt(path_questions).get("cred_file_path", "")
-        file_path = Path(file_path_str.strip())
-        if file_path.exists() and file_path.is_file():
-            parse_creds_file(file_path)
-        else:
-            console.print("[red]❌ The specified file path does not exist or is not a file.[/red]")
+        if not file_to_parse:
+            path_questions = [
+                {"type": "input", "message": "Please enter the path to your credentials file:", "name": "cred_file_path"}
+            ]
+            file_path_str = prompt(path_questions).get("cred_file_path", "")
+            file_path = Path(file_path_str.strip())
+            if file_path.exists() and file_path.is_file():
+                file_to_parse = file_path
+            else:
+                console.print("[red]❌ The specified file path does not exist or is not a file.[/red]")
+                return
 
-    elif cred_method: # Manual entry
+        if file_to_parse:
+            try:
+                with open(file_to_parse, "r") as f:
+                    for line in f:
+                        if "=" in line:
+                            key, value = line.strip().split("=", 1)
+                            if key == "NEO4J_URI":
+                                creds["uri"] = value
+                            elif key == "NEO4J_USERNAME":
+                                creds["username"] = value
+                            elif key == "NEO4J_PASSWORD":
+                                creds["password"] = value
+            except Exception as e:
+                console.print(f"[red]❌ Failed to parse credentials file: {e}[/red]")
+                return
+
+    elif cred_method:  # Manual entry
         console.print("Please enter your remote Neo4j connection details.")
         questions = [
             {"type": "input", "message": "URI (e.g., neo4j+s://xxxx.databases.neo4j.io):", "name": "uri"},
             {"type": "input", "message": "Username:", "name": "username", "default": "neo4j"},
             {"type": "password", "message": "Password:", "name": "password"},
         ]
-        creds = prompt(questions)
-        if not creds: return # User cancelled
-        try:
-            env_path = get_project_root() / ".env"
-            with open(env_path, "w") as f:
-                f.write(f"NEO4J_URI={creds.get('uri', '')}\n")
-                f.write(f"NEO4J_USERNAME={creds.get('username', 'neo4j')}\n")
-                f.write(f"NEO4J_PASSWORD={creds.get('password', '')}\n")
-            console.print("[green]✅ Configuration for hosted database saved to .env file in project root.[/green]")
-        except Exception as e:
-            console.print(f"[red]❌ Failed to write .env file: {e}[/red]")
+        manual_creds = prompt(questions)
+        if not manual_creds: return  # User cancelled
+        creds = manual_creds
+
+    if creds.get("uri") and creds.get("password"):
+        _generate_mcp_json(creds)
+    else:
+        console.print("[red]❌ Incomplete credentials. Please try again.[/red]")
 
 def setup_local_db():
     """Guides user to set up a local Neo4j instance."""
@@ -271,13 +313,10 @@ def setup_local_binary():
     console.print("\n[yellow]Waiting 10 seconds for the database to become available...""")
     time.sleep(10)
 
-    try:
-        env_path = get_project_root() / ".env"
-        with open(env_path, "w") as f:
-            f.write(f"NEO4J_URI=neo4j://localhost:7687\n")
-            f.write(f"NEO4J_USERNAME=neo4j\n")
-            f.write(f"NEO4J_PASSWORD={new_password}\n")
-        console.print("[green]✅ Configuration for local database saved to .env file in project root.[/green]")
-        console.print("\n[bold green]All done! Your local Neo4j instance is ready to use.[/bold green]")
-    except Exception as e:
-        console.print(f"[bold red]Failed to write .env file:[/bold red] {e}")
+    creds = {
+        "uri": "neo4j://localhost:7687",
+        "username": "neo4j",
+        "password": new_password
+    }
+    _generate_mcp_json(creds)
+    console.print("\n[bold green]All done! Your local Neo4j instance is ready to use.[/bold green]")

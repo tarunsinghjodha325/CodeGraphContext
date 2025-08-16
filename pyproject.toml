@@ -1,6 +1,6 @@
 [project]
 name = "codegraphcontext"
-version = "0.1.0"
+version = "0.1.3"
 description = "An MCP server that indexes local code into a graph database to provide context to AI assistants."
 authors = [{ name = "Shashank Shekhar Singh", email = "shashankshekharsingh1205@gmail.com" }]
 readme = "README.md"
@@ -39,5 +39,8 @@ dev = [
 ]
 
 [tool.setuptools]
-packages = ["codegraphcontext"]
 package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["codegraphcontext*"]

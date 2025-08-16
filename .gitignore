@@ -29,3 +29,6 @@ build/
 .pytest_cache/
 coverage.xml
 htmlcov/
+
+# MCP
+mcp.json

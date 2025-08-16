@@ -3,16 +3,11 @@ import typer
 from rich.console import Console
 import asyncio
 import logging
-from dotenv import load_dotenv 
-
-from .setup_wizard import run_setup_wizard
 from codegraphcontext.server import MCPServer
+from .setup_wizard import run_setup_wizard
 
 # Set the log level for the noisy neo4j logger to WARNING
 logging.getLogger("neo4j").setLevel(logging.WARNING) # <-- ADD THIS LINE
-
-# Load environment variables from .env file at the very beginning
-load_dotenv()
 
 app = typer.Typer(
     name="cgc",
