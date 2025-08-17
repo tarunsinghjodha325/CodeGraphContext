@@ -72,6 +72,12 @@ Once the server is running, you can interact with it through your AI assistant u
     OR
     -   "Keep the code graph updated for the project I'm working on at `~/dev/main-app`."
 
+    When you ask to watch a directory, the system performs two actions at once:
+    1.  It kicks off a full scan to index all the code in that directory. This process runs in the background, and you'll receive a `job_id` to track its progress.
+    2.  It begins watching the directory for any file changes to keep the graph updated in real-time.
+
+    This means you can start by simply telling the system to watch a directory, and it will handle both the initial indexing and the continuous updates automatically.
+
 ### Querying and Understanding Code
 
 -   **Finding where code is defined:**

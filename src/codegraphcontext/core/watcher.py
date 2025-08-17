@@ -10,6 +10,7 @@ from watchdog.events import FileSystemEventHandler
 # The actual object is passed in __init__
 if typing.TYPE_CHECKING:
     from codegraphcontext.tools.graph_builder import GraphBuilder
+    from codegraphcontext.core.jobs import JobManager
 
 
 logger = logging.getLogger(__name__)
@@ -69,22 +70,40 @@ class DebouncedEventHandler(FileSystemEventHandler):
 
 class CodeWatcher:
     """Manages file system watching in a background thread."""
-    def __init__(self, graph_builder: "GraphBuilder"):
+    def __init__(self, graph_builder: "GraphBuilder", job_manager: "JobManager"):
         self.graph_builder = graph_builder
+        self.job_manager = job_manager
         self.observer = Observer()
         self.watched_paths = set()
         self.event_handler = DebouncedEventHandler(self.graph_builder)
 
     def watch_directory(self, path: str):
-        """Starts watching a directory if not already watched."""
-        path = str(Path(path).resolve())
-        if path in self.watched_paths:
-            logger.info(f"Path already being watched: {path}")
-            return
+        """
+        Starts watching a directory and returns the job ID for the initial scan if found.
+        """
+        path_obj = Path(path).resolve()
+        path_str = str(path_obj)
+
+        if path_str in self.watched_paths:
+            logger.info(f"Path already being watched: {path_str}")
+            return {"message": f"Path already being watched: {path_str}"}
         
-        self.observer.schedule(self.event_handler, path, recursive=True)
-        self.watched_paths.add(path)
-        logger.info(f"Started watching for code changes in: {path}")
+        self.observer.schedule(self.event_handler, path_str, recursive=True)
+        self.watched_paths.add(path_str)
+        logger.info(f"Started watching for code changes in: {path_str}")
+
+        active_job = self.job_manager.find_active_job_by_path(path_str)
+
+        response = {
+            "message": f"Started watching {path_str} for changes."
+        }
+        if active_job:
+            response["job_id"] = active_job.job_id
+            response["message"] += f" An initial scan is in progress under job ID: {active_job.job_id}"
+        else:
+            response["note"] = "No active initial scan was found for this path. The watcher will only process new changes."
+        
+        return response
 
     def start(self):
         """Starts the observer thread."""

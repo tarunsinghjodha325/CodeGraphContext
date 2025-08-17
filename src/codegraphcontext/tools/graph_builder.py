@@ -23,6 +23,68 @@ def debug_log(message):
         f.flush()
 
 
+class CyclomaticComplexityVisitor(ast.NodeVisitor):
+    """Calculates cyclomatic complexity for a given AST node."""
+    def __init__(self):
+        self.complexity = 1
+
+    def visit_If(self, node):
+        self.complexity += 1
+        self.generic_visit(node)
+
+    def visit_For(self, node):
+        self.complexity += 1
+        self.generic_visit(node)
+
+    def visit_While(self, node):
+        self.complexity += 1
+        self.generic_visit(node)
+
+    def visit_With(self, node):
+        self.complexity += len(node.items)
+        self.generic_visit(node)
+
+    def visit_AsyncFor(self, node):
+        self.complexity += 1
+        self.generic_visit(node)
+
+    def visit_AsyncWith(self, node):
+        self.complexity += len(node.items)
+        self.generic_visit(node)
+
+    def visit_ExceptHandler(self, node):
+        self.complexity += 1
+        self.generic_visit(node)
+
+    def visit_BoolOp(self, node):
+        self.complexity += len(node.values) - 1
+        self.generic_visit(node)
+
+    def visit_ListComp(self, node):
+        self.complexity += len(node.generators)
+        self.generic_visit(node)
+
+    def visit_SetComp(self, node):
+        self.complexity += len(node.generators)
+        self.generic_visit(node)
+
+    def visit_DictComp(self, node):
+        self.complexity += len(node.generators)
+        self.generic_visit(node)
+
+    def visit_GeneratorExp(self, node):
+        self.complexity += len(node.generators)
+        self.generic_visit(node)
+
+    def visit_IfExp(self, node):
+        self.complexity += 1
+        self.generic_visit(node)
+
+    def visit_match_case(self, node):
+        self.complexity += 1
+        self.generic_visit(node)
+
+
 class CodeVisitor(ast.NodeVisitor):
     """Enhanced AST visitor to extract code elements with better function call detection"""
 
@@ -62,6 +124,9 @@ class CodeVisitor(ast.NodeVisitor):
 
     def visit_FunctionDef(self, node):
         """Visit function definitions"""
+        complexity_visitor = CyclomaticComplexityVisitor()
+        complexity_visitor.visit(node)
+        
         func_data = {
             "name": node.name,
             "line_number": node.lineno,
@@ -76,6 +141,7 @@ class CodeVisitor(ast.NodeVisitor):
                 ast.unparse(dec) if hasattr(ast, "unparse") else ""
                 for dec in node.decorator_list
             ],
+            "cyclomatic_complexity": complexity_visitor.complexity,
         }
         self.functions.append(func_data)
         self._push_context(node.name, "function", node.lineno)
@@ -236,6 +302,7 @@ class GraphBuilder:
             try:
                 session.run("CREATE CONSTRAINT repository_path IF NOT EXISTS FOR (r:Repository) REQUIRE r.path IS UNIQUE")
                 session.run("CREATE CONSTRAINT file_path IF NOT EXISTS FOR (f:File) REQUIRE f.path IS UNIQUE")
+                session.run("CREATE CONSTRAINT directory_path IF NOT EXISTS FOR (d:Directory) REQUIRE d.path IS UNIQUE")
                 session.run("CREATE CONSTRAINT function_unique IF NOT EXISTS FOR (f:Function) REQUIRE (f.name, f.file_path, f.line_number) IS UNIQUE")
                 session.run("CREATE CONSTRAINT class_unique IF NOT EXISTS FOR (c:Class) REQUIRE (c.name, c.file_path, c.line_number) IS UNIQUE")
                 session.run("CREATE CONSTRAINT variable_unique IF NOT EXISTS FOR (v:Variable) REQUIRE (v.name, v.file_path, v.line_number) IS UNIQUE")
@@ -280,12 +347,42 @@ class GraphBuilder:
             except ValueError:
                 relative_path = file_name
 
+            # Create/Merge the file node
             session.run("""
-                MATCH (r:Repository {name: $repo_name})
                 MERGE (f:File {path: $path})
                 SET f.name = $name, f.relative_path = $relative_path, f.is_dependency = $is_dependency
-                MERGE (r)-[:CONTAINS]->(f)
-            """, repo_name=repo_name, path=file_path_str, name=file_name, relative_path=relative_path, is_dependency=is_dependency)
+            """, path=file_path_str, name=file_name, relative_path=relative_path, is_dependency=is_dependency)
+
+            # Create directory structure and link it
+            file_path_obj = Path(file_path_str)
+            repo_path_obj = Path(repo_result['path'])
+            
+            relative_path_to_file = file_path_obj.relative_to(repo_path_obj)
+            
+            parent_path = str(repo_path_obj)
+            parent_label = 'Repository'
+
+            # Create nodes for each directory part of the path
+            for part in relative_path_to_file.parts[:-1]: # For each directory in the path
+                current_path = Path(parent_path) / part
+                current_path_str = str(current_path)
+                
+                session.run(f"""
+                    MATCH (p:{parent_label} {{path: $parent_path}})
+                    MERGE (d:Directory {{path: $current_path}})
+                    SET d.name = $part
+                    MERGE (p)-[:CONTAINS]->(d)
+                """, parent_path=parent_path, current_path=current_path_str, part=part)
+
+                parent_path = current_path_str
+                parent_label = 'Directory'
+
+            # Link the last directory/repository to the file
+            session.run(f"""
+                MATCH (p:{parent_label} {{path: $parent_path}})
+                MATCH (f:File {{path: $file_path}})
+                MERGE (p)-[:CONTAINS]->(f)
+            """, parent_path=parent_path, file_path=file_path_str)
 
             for item_data, label in [(file_data['functions'], 'Function'), (file_data['classes'], 'Class'), (file_data['variables'], 'Variable')]:
                 for item in item_data:
@@ -444,6 +541,14 @@ class GraphBuilder:
         """Deletes a file and all its contained elements and relationships."""
         file_path_str = str(Path(file_path).resolve())
         with self.driver.session() as session:
+            # Get parent directories
+            parents_res = session.run("""
+                MATCH (f:File {path: $path})<-[:CONTAINS*]-(d:Directory)
+                RETURN d.path as path ORDER BY length(d.path) DESC
+            """, path=file_path_str)
+            parent_paths = [record["path"] for record in parents_res]
+
+            # Delete the file and its contents
             session.run(
                 """
                 MATCH (f:File {path: $path})
@@ -453,6 +558,25 @@ class GraphBuilder:
                 path=file_path_str,
             )
             logger.info(f"Deleted file and its elements from graph: {file_path_str}")
+
+            # Clean up empty parent directories, starting from the deepest
+            for path in parent_paths:
+                session.run("""
+                    MATCH (d:Directory {path: $path})
+                    WHERE NOT (d)-[:CONTAINS]->()
+                    DETACH DELETE d
+                """, path=path)
+
+    def delete_repository_from_graph(self, repo_path: str):
+        """Deletes a repository and all its contents from the graph."""
+        repo_path_str = str(Path(repo_path).resolve())
+        with self.driver.session() as session:
+            session.run("""
+                MATCH (r:Repository {path: $path})
+                OPTIONAL MATCH (r)-[:CONTAINS*]->(e)
+                DETACH DELETE r, e
+            """, path=repo_path_str)
+            logger.info(f"Deleted repository and its contents from graph: {repo_path_str}")
 
     def update_file_in_graph(self, file_path: Path):
         """Updates a file by deleting and re-adding it."""

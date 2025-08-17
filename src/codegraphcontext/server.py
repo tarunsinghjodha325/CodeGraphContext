@@ -60,7 +60,7 @@ class MCPServer:
         self.code_finder = CodeFinder(self.db_manager)
         self.import_extractor = ImportExtractor()
         
-        self.code_watcher = CodeWatcher(self.graph_builder)
+        self.code_watcher = CodeWatcher(self.graph_builder, self.job_manager)
         
         self._init_tools()
 
@@ -69,7 +69,7 @@ class MCPServer:
         self.tools = {
             "add_code_to_graph": {
                 "name": "add_code_to_graph",
-                "description": "Add code from a local folder to the graph. Returns a job ID for background processing.",
+                "description": "Performs a one-time scan of a local folder to add its code to the graph. Ideal for indexing libraries, dependencies, or projects not being actively modified. Returns a job ID for background processing.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -117,7 +117,7 @@ class MCPServer:
             },
             "watch_directory": {
                 "name": "watch_directory",
-                "description": "Start watching a directory for code changes and automatically update the graph.",
+                "description": "Performs an initial scan of a directory and then continuously monitors it for changes, automatically keeping the graph up-to-date. Ideal for projects under active development. Returns a job ID for the initial scan.",
                 "inputSchema": {
                     "type": "object",
                     "properties": { "path": {"type": "string", "description": "Path to directory to watch"} },
@@ -165,6 +165,47 @@ class MCPServer:
                     "type": "object",
                     "properties": {},
                     "additionalProperties": False
+                }
+            },
+            "calculate_cyclomatic_complexity": {
+                "name": "calculate_cyclomatic_complexity",
+                "description": "Calculate the cyclomatic complexity of a specific function to measure its complexity.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "function_name": {"type": "string", "description": "The name of the function to analyze."},
+                        "file_path": {"type": "string", "description": "Optional: The full path to the file containing the function for a more specific query."}
+                    },
+                    "required": ["function_name"]
+                }
+            },
+            "find_most_complex_functions": {
+                "name": "find_most_complex_functions",
+                "description": "Find the most complex functions in the codebase based on cyclomatic complexity.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "limit": {"type": "integer", "description": "The maximum number of complex functions to return.", "default": 10}
+                    }
+                }
+            },
+            "list_indexed_repositories": {
+                "name": "list_indexed_repositories",
+                "description": "List all indexed repositories.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {}
+                }
+            },
+            "delete_repository": {
+                "name": "delete_repository",
+                "description": "Delete an indexed repository from the graph.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "repo_path": {"type": "string", "description": "The path of the repository to delete."}
+                    },
+                    "required": ["repo_path"]
                 }
             }
             # Other tools like list_imports, add_package_to_graph can be added here following the same pattern
@@ -276,6 +317,70 @@ class MCPServer:
             debug_log(f"Error finding dead code: {str(e)}")
             return {"error": f"Failed to find dead code: {str(e)}"}
 
+    def calculate_cyclomatic_complexity_tool(self, **args) -> Dict[str, Any]:
+        """Tool to calculate cyclomatic complexity for a given function."""
+        function_name = args.get("function_name")
+        file_path = args.get("file_path")
+
+        try:
+            debug_log(f"Calculating cyclomatic complexity for function: {function_name}")
+            results = self.code_finder.get_cyclomatic_complexity(function_name, file_path)
+            
+            response = {
+                "success": True,
+                "function_name": function_name,
+                "results": results
+            }
+            if file_path:
+                response["file_path"] = file_path
+            
+            return response
+        except Exception as e:
+            debug_log(f"Error calculating cyclomatic complexity: {str(e)}")
+            return {"error": f"Failed to calculate cyclomatic complexity: {str(e)}"}
+
+    def find_most_complex_functions_tool(self, **args) -> Dict[str, Any]:
+        """Tool to find the most complex functions."""
+        limit = args.get("limit", 10)
+        try:
+            debug_log(f"Finding the top {limit} most complex functions.")
+            results = self.code_finder.find_most_complex_functions(limit)
+            return {
+                "success": True,
+                "limit": limit,
+                "results": results
+            }
+        except Exception as e:
+            debug_log(f"Error finding most complex functions: {str(e)}")
+            return {"error": f"Failed to find most complex functions: {str(e)}"}
+
+    def list_indexed_repositories_tool(self, **args) -> Dict[str, Any]:
+        """Tool to list indexed repositories."""
+        try:
+            debug_log("Listing indexed repositories.")
+            results = self.code_finder.list_indexed_repositories()
+            return {
+                "success": True,
+                "repositories": results
+            }
+        except Exception as e:
+            debug_log(f"Error listing indexed repositories: {str(e)}")
+            return {"error": f"Failed to list indexed repositories: {str(e)}"}
+
+    def delete_repository_tool(self, **args) -> Dict[str, Any]:
+        """Tool to delete a repository from the graph."""
+        repo_path = args.get("repo_path")
+        try:
+            debug_log(f"Deleting repository: {repo_path}")
+            self.graph_builder.delete_repository_from_graph(repo_path)
+            return {
+                "success": True,
+                "message": f"Repository '{repo_path}' deleted successfully."
+            }
+        except Exception as e:
+            debug_log(f"Error deleting repository: {str(e)}")
+            return {"error": f"Failed to delete repository: {str(e)}"}
+
     def watch_directory_tool(self, **args) -> Dict[str, Any]:
         """Tool to start watching a directory."""
         path = args.get("path")
@@ -283,17 +388,23 @@ class MCPServer:
             return {"error": f"Invalid path provided: {path}. Must be a directory."}
 
         try:
-            initial_scan_result = self.add_code_to_graph_tool(path=path, is_dependency=False)
-            if "error" in initial_scan_result:
-                return initial_scan_result
+            # First, ensure the code is added/scanned
+            scan_job_result = self.add_code_to_graph_tool(path=path, is_dependency=False)
+            if "error" in scan_job_result:
+                return scan_job_result
 
-            self.code_watcher.watch_directory(path)
+            # Now, start the watcher
+            watch_result = self.code_watcher.watch_directory(path)
             
-            return {
+            # Combine results
+            final_result = {
                 "success": True,
-                "message": f"Initial scan started (Job ID: {initial_scan_result.get('job_id')}). Now watching for live changes in {path}.",
-                "instructions": "Changes to .py files in this directory will now be automatically updated in the graph."
+                "message": f"Initial scan started for {path}. Now watching for live changes.",
+                "job_id": scan_job_result.get("job_id"),
+                "details": watch_result
             }
+            return final_result
+            
         except Exception as e:
             logger.error(f"Failed to start watching directory {path}: {e}")
             return {"error": f"Failed to start watching directory: {str(e)}"}
@@ -555,7 +666,11 @@ class MCPServer:
             "execute_cypher_query": self.execute_cypher_query_tool,
             "add_code_to_graph": self.add_code_to_graph_tool,
             "check_job_status": self.check_job_status_tool,
-            "list_jobs": self.list_jobs_tool
+            "list_jobs": self.list_jobs_tool,
+            "calculate_cyclomatic_complexity": self.calculate_cyclomatic_complexity_tool,
+            "find_most_complex_functions": self.find_most_complex_functions_tool,
+            "list_indexed_repositories": self.list_indexed_repositories_tool,
+            "delete_repository": self.delete_repository_tool
         }
         handler = tool_map.get(tool_name)
         if handler:

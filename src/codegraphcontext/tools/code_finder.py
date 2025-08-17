@@ -522,6 +522,14 @@ class CodeFinder:
                     "summary": f"Found {len(results['potentially_unused_functions'])} potentially unused functions"
                 }
             
+            elif query_type == "find_complexity":
+                limit = int(context) if context and context.isdigit() else 10
+                results = self.find_most_complex_functions(limit)
+                return {
+                    "query_type": "find_complexity", "limit": limit, "results": results,
+                    "summary": f"Found the top {len(results)} most complex functions"
+                }
+            
             elif query_type in ["call_chain", "path", "chain"]:
                 if '->' in target:
                     start_func, end_func = target.split('->', 1)
@@ -556,7 +564,7 @@ class CodeFinder:
                     "supported_types": [
                         "find_callers", "find_callees", "find_importers", "who_modifies",
                         "class_hierarchy", "overrides", "dead_code", "call_chain",
-                        "module_deps", "variable_scope"
+                        "module_deps", "variable_scope", "find_complexity"
                     ]
                 }
         
@@ -566,3 +574,46 @@ class CodeFinder:
                 "query_type": query_type,
                 "target": target
             }
+
+    def get_cyclomatic_complexity(self, function_name: str, file_path: str = None) -> List[Dict]:
+        """Get the cyclomatic complexity of a function."""
+        with self.driver.session() as session:
+            if file_path:
+                # Use ENDS WITH for flexible path matching
+                query = """
+                    MATCH (f:Function {name: $function_name})
+                    WHERE f.file_path ENDS WITH $file_path
+                    RETURN f.name as function_name, f.file_path as file_path, f.cyclomatic_complexity as complexity
+                """
+                result = session.run(query, function_name=function_name, file_path=file_path)
+            else:
+                query = """
+                    MATCH (f:Function {name: $function_name})
+                    RETURN f.name as function_name, f.file_path as file_path, f.cyclomatic_complexity as complexity
+                """
+                result = session.run(query, function_name=function_name)
+            
+            return [dict(record) for record in result]
+
+    def find_most_complex_functions(self, limit: int = 10) -> List[Dict]:
+        """Find the most complex functions based on cyclomatic complexity."""
+        with self.driver.session() as session:
+            query = """
+                MATCH (f:Function)
+                WHERE f.cyclomatic_complexity IS NOT NULL
+                RETURN f.name as function_name, f.file_path as file_path, f.cyclomatic_complexity as complexity, f.line_number as line_number
+                ORDER BY f.cyclomatic_complexity DESC
+                LIMIT $limit
+            """
+            result = session.run(query, limit=limit)
+            return [dict(record) for record in result]
+
+    def list_indexed_repositories(self) -> List[Dict]:
+        """List all indexed repositories."""
+        with self.driver.session() as session:
+            result = session.run("""
+                MATCH (r:Repository)
+                RETURN r.name as name, r.path as path, r.is_dependency as is_dependency
+                ORDER BY r.name
+            """)
+            return [dict(record) for record in result]

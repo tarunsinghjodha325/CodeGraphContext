@@ -5,6 +5,8 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass, asdict
 from enum import Enum
 from typing import Any, Dict, List, Optional
+from pathlib import Path
+
 
 class JobStatus(Enum):
     """Job status enumeration"""
@@ -89,6 +91,23 @@ class JobManager:
         """List all jobs"""
         with self.lock:
             return list(self.jobs.values())
+
+    def find_active_job_by_path(self, path: str) -> Optional[JobInfo]:
+        """Finds the most recent, active job for a given path."""
+        with self.lock:
+            path_obj = Path(path).resolve()
+            
+            matching_jobs = sorted(
+                [job for job in self.jobs.values() if job.path and Path(job.path).resolve() == path_obj],
+                key=lambda j: j.start_time,
+                reverse=True
+            )
+
+            for job in matching_jobs:
+                if job.status in [JobStatus.PENDING, JobStatus.RUNNING]:
+                    return job
+                    
+            return None
 
     def cleanup_old_jobs(self, max_age_hours: int = 24):
         """Clean up jobs older than specified hours"""
