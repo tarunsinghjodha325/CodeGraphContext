@@ -3,7 +3,7 @@ import asyncio
 import json
 import logging
 import importlib
-import stdlibs
+
 import sys
 import traceback
 import os
@@ -104,7 +104,7 @@ class MCPServer:
             },
             "analyze_code_relationships": {
                 "name": "analyze_code_relationships",
-                "description": "Analyze code relationships like 'who calls this function' or 'class hierarchy'.",
+                "description": "Analyze code relationships like 'find_callers', 'find_callees', 'find_importers', 'who_modifies','class_hierarchy', 'overrides', 'dead_code', 'call_chain','module_deps', 'variable_scope', 'find_complexity'.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -442,22 +442,40 @@ class MCPServer:
                             all_imports.update(extract_func(str(file_path)))
             else:
                 return {"error": f"Path {path} does not exist"}
-            
+
+            all_imports_with_type = []
             if language == 'python':
-                # Get the list of stdlib modules for the current Python version
-                stdlib_modules = set(stdlibs.module_names)
-                # stdlib_modules = {
-                #     'os', 'sys', 'json', 'time', 'datetime', 'math', 'random', 're', 'collections', 
-                #     'itertools', 'functools', 'operator', 'pathlib', 'urllib', 'http', 'logging', 
-                #     'threading', 'multiprocessing', 'asyncio', 'typing', 'dataclasses', 'enum', 
-                #     'abc', 'io', 'csv', 'sqlite3', 'pickle', 'base64', 'hashlib', 'hmac', 'secrets', 
-                #     'unittest', 'doctest', 'pdb', 'profile', 'cProfile', 'timeit'
-                # }
-                all_imports = all_imports - stdlib_modules
+                builtin_c_modules = set(sys.builtin_module_names)
+                python_version_lib_path = os.path.join('lib', f'python{sys.version_info.major}.{sys.version_info.minor}')
+
+                for imp in all_imports:
+                    is_stdlib = False
+                    if imp in builtin_c_modules:
+                        is_stdlib = True
+                    else:
+                        try:
+                            spec = importlib.util.find_spec(imp)
+                            if spec and spec.origin and spec.origin.endswith('.py') and python_version_lib_path in spec.origin:
+                                is_stdlib = True
+                        except Exception:
+                            pass # Ignore errors for modules that can't be found or imported
+
+                    all_imports_with_type.append({
+                        "name": imp,
+                        "is_stdlib": is_stdlib
+                    })
+            else:
+                for imp in all_imports:
+                    all_imports_with_type.append({
+                        "name": imp,
+                        "is_stdlib": False # Default to False for non-Python languages
+                    })
             
             return {
-                "imports": sorted(list(all_imports)), "language": language,
-                "path": path, "count": len(all_imports)
+                "imports": sorted(all_imports_with_type, key=lambda x: x['name']),
+                "language": language,
+                "path": path,
+                "count": len(all_imports_with_type)
             }
         
         except Exception as e:
@@ -470,6 +488,11 @@ class MCPServer:
         
         try:
             path_obj = Path(path).resolve()
+            
+            # Check if the repository is already indexed
+            indexed_repos = self.code_finder.list_indexed_repositories()
+            if str(path_obj) in [repo['path'] for repo in indexed_repos]:
+                return {"warning": f"Repository at '{path}' is already indexed. If you want to re-index, please delete it first using the 'delete_repository' tool."}
 
             if not path_obj.exists():
                 return {"error": f"Path {path} does not exist"}
@@ -505,15 +528,78 @@ class MCPServer:
         package_name = args.get("package_name")
         is_dependency = args.get("is_dependency", True)
         
+        # Get the list of C-implemented built-in modules
+        builtin_c_modules = set(sys.builtin_module_names)
+
+        # 1. Check if the package is a C-implemented built-in module (highest priority)
+        if package_name in builtin_c_modules:
+            return {"warning": f"'{package_name}': is a built-in Python module and cannot be added to the graph. These modules are part of the Python installation and are not user-installed packages."}
+
+        # 2. Check if a repository with this package name already exists
+        with self.db_manager.get_driver().session() as session:
+            existing_repo = session.run("MATCH (r:Repository {name: $package_name}) RETURN r.path as path", package_name=package_name).single()
+            if existing_repo:
+                return {"warning": f"Package '{package_name}' is already indexed from path '{existing_repo['path']}'. If you want to re-index, please delete it first using the 'delete_repository' tool."}
+
+        package_path = None
         try:
+            spec = importlib.util.find_spec(package_name)
+            if spec and spec.origin:
+                # Get the standard library path - normalize it to handle symlinks and relative paths
+                stdlib_path = os.path.normpath(os.path.join(sys.prefix, 'lib', f'python{sys.version_info.major}.{sys.version_info.minor}'))
+                spec_origin_normalized = os.path.normpath(spec.origin)
+                
+                # Check if this is a standard library module
+                if spec_origin_normalized.startswith(stdlib_path):
+                    # It's a standard library module
+                    if spec.origin.endswith('__init__.py'):
+                        package_path = os.path.dirname(spec.origin) # Path to the package directory
+                    elif spec.origin.endswith('.py'):
+                        package_path = spec.origin # Path to the single module file
+                    else:
+                        # This case handles standard library components that are not .py files
+                        # (e.g., C extensions within stdlib like _io.cpython-311-x86_64-linux-gnu.so)
+                        return {"warning": f"'{package_name}': is a standard library module but its primary component is not a pure Python file (.py) or package directory. It cannot be added to the graph in this manner."}
+                else:
+                    # Not a standard library module, so it's a user-installed package or local code
+                    package_path = self.get_local_package_path(package_name)
+            else:
+                # spec.origin is None, meaning importlib couldn't find a file path.
+                # This could be a namespace package, or a module that's not file-backed (e.g., some built-ins).
+                try:
+                    module = importlib.import_module(package_name)
+                    if not hasattr(module, '__file__') or module.__file__ is None:
+                        # This is likely a built-in module or C extension that doesn't have a __file__
+                        return {"warning": f"'{package_name}': appears to be a built-in module without a file path and cannot be added to the graph."}
+                    else:
+                        # Has a __file__, try the fallback method
+                        package_path = self.get_local_package_path(package_name)
+                except ImportError:
+                    # Module doesn't exist, try fallback anyway
+                    package_path = self.get_local_package_path(package_name)
+
+        except Exception as e:
+            debug_log(f"Error during spec finding for {package_name}: {e}")
+            # If importlib.util.find_spec itself fails, try the fallback
             package_path = self.get_local_package_path(package_name)
-            
-            if not package_path:
-                return {"error": f"Could not find package '{package_name}'. Make sure it's installed."}
-            
-            if not os.path.exists(package_path):
-                return {"error": f"Package path '{package_path}' does not exist"}
-            
+
+        # Now, proceed with the job creation if a valid package_path was found
+        if not package_path:
+            return {"error": f"Could not find package '{package_name}'. Make sure it's installed or is a pure Python standard library module."}
+        
+        if not os.path.exists(package_path):
+            return {"error": f"Package path '{package_path}' does not exist"}
+        
+        # Additional safety check: if the discovered path points to the entire stdlib directory, reject it
+        stdlib_dir = os.path.normpath(os.path.join(sys.prefix, 'lib', f'python{sys.version_info.major}.{sys.version_info.minor}'))
+        try:
+            if os.path.samefile(package_path, stdlib_dir):
+                return {"error": f"Package '{package_name}' resolves to the entire Python standard library directory. This would process thousands of files and is likely not what you intended."}
+        except OSError:
+            # samefile can fail if paths don't exist, ignore this check in that case
+            pass
+        
+        try: # This is the main try block for job creation
             path_obj = Path(package_path)
             
             total_files, estimated_time = self.graph_builder.estimate_processing_time(path_obj)
