@@ -522,7 +522,7 @@ class MCPServer:
             # Check if the package is already indexed
             indexed_repos = self.list_indexed_repositories_tool().get("repositories", [])
             for repo in indexed_repos:
-                if repo.get("name") == package_name and repo.get("is_dependency"):
+                if repo.get("is_dependency") and (repo.get("name") == package_name or repo.get("name") == f"{package_name}.py"):
                     return {
                         "success": False,
                         "message": f"Package '{package_name}' is already indexed."
