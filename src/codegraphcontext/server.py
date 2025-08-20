@@ -209,9 +209,7 @@ class MCPServer:
                 }
             }
             # Other tools like list_imports, add_package_to_graph can be added here following the same pattern
-        }
-
-    
+        }    
 
     def get_database_status(self) -> dict:
         """Get current database connection status"""
@@ -225,24 +223,30 @@ class MCPServer:
             module = importlib.import_module(package_name)
             
             if hasattr(module, '__file__') and module.__file__:
-                module_file = module.__file__
+                module_file = Path(module.__file__)
                 debug_log(f"Module file: {module_file}")
-                
-                if module_file.endswith('__init__.py'):
-                    package_path = os.path.dirname(module_file)
+
+                if module_file.name == '__init__.py':
+                    # It's a package (directory)
+                    package_path = str(module_file.parent)
+                elif package_name in stdlibs.module_names:
+                    # It's a single-file standard library module (e.g., os.py, io.py)
+                    package_path = str(module_file)
                 else:
-                    package_path = os.path.dirname(module_file)
-                
-                debug_log(f"Package path: {package_path}")
+                    # Default to parent directory for other single-file modules
+                    package_path = str(module_file.parent)
+
+                debug_log(f"Determined package path: {package_path}")
                 return package_path
-            
+
             elif hasattr(module, '__path__'):
+                # This handles namespace packages or packages without __init__.py
                 if isinstance(module.__path__, list) and module.__path__:
-                    package_path = module.__path__[0]
+                    package_path = str(Path(module.__path__[0]))
                     debug_log(f"Package path from __path__: {package_path}")
                     return package_path
                 else:
-                    package_path = str(module.__path__)
+                    package_path = str(Path(str(module.__path__)))
                     debug_log(f"Package path from __path__ (str): {package_path}")
                     return package_path
             
