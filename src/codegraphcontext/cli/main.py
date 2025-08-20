@@ -73,30 +73,36 @@ def tool(
     - `list_indexed_repositories`: List indexed repositories. Args: None\n
     - `delete_repository`: Delete an indexed repository. Args: `repo_path` (str)
     """
-    async def _run_tool_async():
-        server = None
-        try:
-            # Instantiate MCPServer directly
-            server = MCPServer()
+    # async def _run_tool_async():
+    #     server = None
+    #     try:
+    #         # Instantiate MCPServer directly
+    #         server = MCPServer()
             
-            # Parse arguments
-            tool_args = json.loads(args)
+    #         # Parse arguments
+    #         tool_args = json.loads(args)
             
-            # Directly call the tool handler
-            result = await server.handle_tool_call(name, tool_args)
+    #         # Directly call the tool handler
+    #         result = await server.handle_tool_call(name, tool_args)
             
-            # Print the result
-            console.print(json.dumps(result, indent=2))
+    #         # Print the result
+    #         console.print(json.dumps(result, indent=2))
 
-        except json.JSONDecodeError:
-            console.print("[bold red]Error:[/bold red] Invalid JSON arguments provided.")
-        except Exception as e:
-            console.print(f"[bold red]An unexpected error occurred:[/bold red] {e}")
-        finally:
-            if server:
-                server.shutdown() # Ensure resources are cleaned up
+    #     except json.JSONDecodeError:
+    #         console.print("[bold red]Error:[/bold red] Invalid JSON arguments provided.")
+    #     except Exception as e:
+    #         console.print(f"[bold red]An unexpected error occurred:[/bold red] {e}")
+    #     finally:
+    #         if server:
+    #             server.shutdown() # Ensure resources are cleaned up
 
-    asyncio.run(_run_tool_async())
+    # asyncio.run(_run_tool_async())
+    
+    # This is a placeholder for a more advanced tool caller that would
+    # connect to the running server via a different mechanism (e.g., a socket).
+    # For now, it's a conceptual part of the CLI.
+    console.print(f"Calling tool [bold cyan]{name}[/bold cyan] with args: {args}")
+    console.print("[yellow]Note: This is a placeholder for direct tool invocation.[/yellow]")
 
 
 @app.command(name="help")

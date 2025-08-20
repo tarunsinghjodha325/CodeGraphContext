@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 import importlib
+from importlib import metadata, util
 
 import sys
 import traceback
@@ -255,7 +256,32 @@ class MCPServer:
         except Exception as e:
             debug_log(f"Error getting local path for {package_name}: {e}")
             return None
-        
+
+    def get_package_path(self, package_name: str) -> Optional[str]:
+        # 1. Builtins
+        if package_name in sys.builtin_module_names:
+            return None
+        # 2. External
+        try:
+            dist = importlib.metadata.distribution(package_name)
+            root = dist.locate_file("")
+            pkg_path = os.path.join(root, package_name)
+            if os.path.exists(pkg_path):
+                return str(pkg_path)
+            return str(root)
+        except importlib.metadata.PackageNotFoundError:
+            pass
+        # 3. Stdlib
+        spec = importlib.util.find_spec(package_name)
+        if spec and spec.origin:
+            if spec.submodule_search_locations:
+                # It's a package
+                return str(spec.submodule_search_locations[0])
+            else:
+                # It's a single-file module
+                return str(spec.origin)
+        return None    
+    
     def execute_cypher_query_tool(self, **args) -> Dict[str, Any]:
         """
         Tool to execute a read-only Cypher query.
@@ -527,92 +553,63 @@ class MCPServer:
         """Tool to add a Python package to Neo4j graph by auto-discovering its location"""
         package_name = args.get("package_name")
         is_dependency = args.get("is_dependency", True)
-        
-        # Get the list of C-implemented built-in modules
-        builtin_c_modules = set(sys.builtin_module_names)
+        package_path = self.get_package_path(package_name)
+        if package_path is None:
+            return {"warning": f"'{package_name}': is either a built-in Python module or a non-installed package and cannot be added to the graph."}
 
-        # 1. Check if the package is a C-implemented built-in module (highest priority)
-        if package_name in builtin_c_modules:
-            return {"warning": f"'{package_name}': is a built-in Python module and cannot be added to the graph. These modules are part of the Python installation and are not user-installed packages."}
-
-        # 2. Check if a repository with this package name already exists
+        # Check if a repository with this package name already exists
         with self.db_manager.get_driver().session() as session:
             existing_repo = session.run("MATCH (r:Repository {name: $package_name}) RETURN r.path as path", package_name=package_name).single()
             if existing_repo:
                 return {"warning": f"Package '{package_name}' is already indexed from path '{existing_repo['path']}'. If you want to re-index, please delete it first using the 'delete_repository' tool."}
 
-        package_path = None
-        try:
-            spec = importlib.util.find_spec(package_name)
-            if spec and spec.origin:
-                # Get the standard library path - normalize it to handle symlinks and relative paths
-                stdlib_path = os.path.normpath(os.path.join(sys.prefix, 'lib', f'python{sys.version_info.major}.{sys.version_info.minor}'))
-                spec_origin_normalized = os.path.normpath(spec.origin)
-                
-                # Check if this is a standard library module
-                if spec_origin_normalized.startswith(stdlib_path):
-                    # It's a standard library module
-                    if spec.origin.endswith('__init__.py'):
-                        package_path = os.path.dirname(spec.origin) # Path to the package directory
-                    elif spec.origin.endswith('.py'):
-                        package_path = spec.origin # Path to the single module file
-                    else:
-                        # This case handles standard library components that are not .py files
-                        # (e.g., C extensions within stdlib like _io.cpython-311-x86_64-linux-gnu.so)
-                        return {"warning": f"'{package_name}': is a standard library module but its primary component is not a pure Python file (.py) or package directory. It cannot be added to the graph in this manner."}
-                else:
-                    # Not a standard library module, so it's a user-installed package or local code
-                    package_path = self.get_local_package_path(package_name)
-            else:
-                # spec.origin is None, meaning importlib couldn't find a file path.
-                # This could be a namespace package, or a module that's not file-backed (e.g., some built-ins).
-                try:
-                    module = importlib.import_module(package_name)
-                    if not hasattr(module, '__file__') or module.__file__ is None:
-                        # This is likely a built-in module or C extension that doesn't have a __file__
-                        return {"warning": f"'{package_name}': appears to be a built-in module without a file path and cannot be added to the graph."}
-                    else:
-                        # Has a __file__, try the fallback method
-                        package_path = self.get_local_package_path(package_name)
-                except ImportError:
-                    # Module doesn't exist, try fallback anyway
-                    package_path = self.get_local_package_path(package_name)
-
-        except Exception as e:
-            debug_log(f"Error during spec finding for {package_name}: {e}")
-            # If importlib.util.find_spec itself fails, try the fallback
-            package_path = self.get_local_package_path(package_name)
-
-        # Now, proceed with the job creation if a valid package_path was found
-        if not package_path:
-            return {"error": f"Could not find package '{package_name}'. Make sure it's installed or is a pure Python standard library module."}
-        
         if not os.path.exists(package_path):
             return {"error": f"Package path '{package_path}' does not exist"}
         
-        # Additional safety check: if the discovered path points to the entire stdlib directory, reject it
-        stdlib_dir = os.path.normpath(os.path.join(sys.prefix, 'lib', f'python{sys.version_info.major}.{sys.version_info.minor}'))
-        try:
-            if os.path.samefile(package_path, stdlib_dir):
-                return {"error": f"Package '{package_name}' resolves to the entire Python standard library directory. This would process thousands of files and is likely not what you intended."}
-        except OSError:
-            # samefile can fail if paths don't exist, ignore this check in that case
+        # Safety check for overly broad paths
+        normalized_package_path = os.path.normpath(package_path)
+        risky_patterns = [
+            os.path.normpath(os.path.join(sys.prefix, 'lib', f'python{sys.version_info.major}.{sys.version_info.minor}', 'site-packages')),
+            os.path.normpath(os.path.join(sys.prefix, 'lib', f'python{sys.version_info.major}.{sys.version_info.minor}')),
+            os.path.normpath(os.path.join(os.path.expanduser('~'), '.pyenv', 'versions', f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}', 'lib', f'python{sys.version_info.major}.{sys.version_info.minor}', 'site-packages')),
+            os.path.normpath(os.path.join(os.path.expanduser('~'), '.pyenv', 'versions', f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}', 'lib', f'python{sys.version_info.major}.{sys.version_info.minor}'))
+            # Add more general patterns if needed, e.g., just 'site-packages' as a substring check
+        ]
+
+        for pattern in risky_patterns:
+            if normalized_package_path == pattern:
+                return {"error": f"Package path '{package_path}' resolves to a broad Python installation directory (e.g., site-packages or standard library). Indexing such a large directory is risky and has been prevented. Please specify a more specific package or module."}
+        
+        # Additional check for standard library modules that are single files directly under lib/pythonX.Y
+        # This prevents indexing the entire stdlib if a module like 'json' is passed.
+        stdlib_dir_prefix = os.path.normpath(os.path.join(sys.prefix, 'lib', f'python{sys.version_info.major}.{sys.version_info.minor}'))
+        if normalized_package_path.startswith(stdlib_dir_prefix) and os.path.isfile(normalized_package_path):
+            # If it's a file within the stdlib, we allow it unless it's the stdlib root itself (which is caught by risky_patterns)
+            # The original intent was to prevent indexing the *entire* stdlib, not individual files.
             pass
+        elif normalized_package_path.startswith(stdlib_dir_prefix) and not os.path.isdir(normalized_package_path):
+            # This handles cases like C extensions in stdlib that are not directories
+            pass
+        elif normalized_package_path.startswith(stdlib_dir_prefix) and normalized_package_path != stdlib_dir_prefix:
+            # If it's a subdirectory within stdlib (e.g., 'collections'), allow it.
+            pass
+        elif normalized_package_path.startswith(stdlib_dir_prefix) and normalized_package_path == stdlib_dir_prefix:
+            # This case should be caught by risky_patterns, but as a double check
+            return {"error": f"Package path '{package_path}' resolves to the entire Python standard library directory. Indexing such a large directory is risky and has been prevented. Please specify a more specific package or module."}
         
         try: # This is the main try block for job creation
             path_obj = Path(package_path)
             
-            total_files, estimated_time = self.graph_builder.estimate_processing_time(path_obj)
-            
+            total_files, estimated_time = self.graph_builder.estimate_processing_time(path_obj)            
             job_id = self.job_manager.create_job(package_path, is_dependency)
             
             self.job_manager.update_job(job_id, total_files=total_files, estimated_duration=estimated_time)
             
+            # Create the task and let it run in the background without awaiting it here
             coro = self.graph_builder.build_graph_from_path_async(
                 path_obj, is_dependency, job_id
             )
             asyncio.run_coroutine_threadsafe(coro, self.loop)
-            
             debug_log(f"Started background job {job_id} for package: {package_name} at {package_path}, is_dependency: {is_dependency}")
             
             return {
@@ -629,6 +626,7 @@ class MCPServer:
             debug_log(f"Error creating background job for package {package_name}: {str(e)}")
             return {"error": f"Failed to start background processing for package '{package_name}': {str(e)}"}
     
+
     def check_job_status_tool(self, **args) -> Dict[str, Any]:
         """Tool to check job status"""
         job_id = args.get("job_id")
