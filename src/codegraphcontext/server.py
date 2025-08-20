@@ -473,6 +473,15 @@ class MCPServer:
 
             if not path_obj.exists():
                 return {"error": f"Path {path} does not exist"}
+
+            # Check if the repository is already indexed
+            indexed_repos = self.list_indexed_repositories_tool().get("repositories", [])
+            for repo in indexed_repos:
+                if Path(repo["path"]).resolve() == path_obj:
+                    return {
+                        "success": False,
+                        "message": f"Repository '{path}' is already indexed."
+                    }
             
             total_files, estimated_time = self.graph_builder.estimate_processing_time(path_obj)
             
@@ -506,6 +515,15 @@ class MCPServer:
         is_dependency = args.get("is_dependency", True)
         
         try:
+            # Check if the package is already indexed
+            indexed_repos = self.list_indexed_repositories_tool().get("repositories", [])
+            for repo in indexed_repos:
+                if repo.get("name") == package_name and repo.get("is_dependency"):
+                    return {
+                        "success": False,
+                        "message": f"Package '{package_name}' is already indexed."
+                    }
+
             package_path = self.get_local_package_path(package_name)
             
             if not package_path:
