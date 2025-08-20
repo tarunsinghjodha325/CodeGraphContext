@@ -679,3 +679,54 @@ class GraphBuilder:
                 self.job_manager.update_job(
                     job_id, status=JobStatus.FAILED, end_time=datetime.now(), errors=[str(e)]
                 )
+
+    
+
+    def add_code_to_graph_tool(
+        self, path: str, is_dependency: bool = False
+    ) -> Dict[str, Any]:
+        """Tool to add code to Neo4j graph with background processing"""
+        try:
+            path_obj = Path(path).resolve()
+            if not path_obj.exists():
+                return {"error": f"Path {path} does not exist"}
+
+            estimation = self.estimate_processing_time(path_obj)
+            if estimation is None:
+                return {"error": f"Could not analyze path {path}."}
+            total_files, estimated_time = estimation
+
+            job_id = self.job_manager.create_job(str(path_obj), is_dependency)
+            self.job_manager.update_job(
+                job_id, total_files=total_files, estimated_duration=estimated_time
+            )
+
+            # Create the coroutine for the background task
+            coro = self.build_graph_from_path_async(path_obj, is_dependency, job_id)
+            
+            # Safely schedule the coroutine to run on the main event loop from this thread
+            asyncio.run_coroutine_threadsafe(coro, self.loop)
+
+            debug_log(f"Started background job {job_id} for path: {str(path_obj)}")
+
+            return {
+                "success": True,
+                "job_id": job_id,
+                "message": f"Background processing started for {path_obj}",
+                "estimated_files": total_files,
+                "estimated_duration_seconds": round(estimated_time, 2),
+            }
+        except Exception as e:
+            debug_log(f"Error creating background job: {str(e)}")
+            return {
+                "error": f"Failed to start background processing: {e.__class__.__name__}: {e}"
+            }
+
+    def add_package_to_graph_tool(
+        self, package_name: str, is_dependency: bool = True
+    ) -> Dict[str, Any]:
+        """Tool to add a Python package to Neo4j graph"""
+        package_path = self.get_local_package_path(package_name)
+        if not package_path:
+            return {"error": f"Could not find package '{package_name}'."}
+        return self.add_code_to_graph_tool(path=package_path, is_dependency=is_dependency)

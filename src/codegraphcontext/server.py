@@ -3,8 +3,7 @@ import asyncio
 import json
 import logging
 import importlib
-from importlib import metadata, util
-
+import stdlibs
 import sys
 import traceback
 import os
@@ -105,7 +104,7 @@ class MCPServer:
             },
             "analyze_code_relationships": {
                 "name": "analyze_code_relationships",
-                "description": "Analyze code relationships like 'find_callers', 'find_callees', 'find_importers', 'who_modifies','class_hierarchy', 'overrides', 'dead_code', 'call_chain','module_deps', 'variable_scope', 'find_complexity'.",
+                "description": "Analyze code relationships like 'who calls this function' or 'class hierarchy'.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -256,32 +255,7 @@ class MCPServer:
         except Exception as e:
             debug_log(f"Error getting local path for {package_name}: {e}")
             return None
-
-    def get_package_path(self, package_name: str) -> Optional[str]:
-        # 1. Builtins
-        if package_name in sys.builtin_module_names:
-            return None
-        # 2. External
-        try:
-            dist = importlib.metadata.distribution(package_name)
-            root = dist.locate_file("")
-            pkg_path = os.path.join(root, package_name)
-            if os.path.exists(pkg_path):
-                return str(pkg_path)
-            return str(root)
-        except importlib.metadata.PackageNotFoundError:
-            pass
-        # 3. Stdlib
-        spec = importlib.util.find_spec(package_name)
-        if spec and spec.origin:
-            if spec.submodule_search_locations:
-                # It's a package
-                return str(spec.submodule_search_locations[0])
-            else:
-                # It's a single-file module
-                return str(spec.origin)
-        return None    
-    
+        
     def execute_cypher_query_tool(self, **args) -> Dict[str, Any]:
         """
         Tool to execute a read-only Cypher query.
@@ -468,40 +442,22 @@ class MCPServer:
                             all_imports.update(extract_func(str(file_path)))
             else:
                 return {"error": f"Path {path} does not exist"}
-
-            all_imports_with_type = []
+            
             if language == 'python':
-                builtin_c_modules = set(sys.builtin_module_names)
-                python_version_lib_path = os.path.join('lib', f'python{sys.version_info.major}.{sys.version_info.minor}')
-
-                for imp in all_imports:
-                    is_stdlib = False
-                    if imp in builtin_c_modules:
-                        is_stdlib = True
-                    else:
-                        try:
-                            spec = importlib.util.find_spec(imp)
-                            if spec and spec.origin and spec.origin.endswith('.py') and python_version_lib_path in spec.origin:
-                                is_stdlib = True
-                        except Exception:
-                            pass # Ignore errors for modules that can't be found or imported
-
-                    all_imports_with_type.append({
-                        "name": imp,
-                        "is_stdlib": is_stdlib
-                    })
-            else:
-                for imp in all_imports:
-                    all_imports_with_type.append({
-                        "name": imp,
-                        "is_stdlib": False # Default to False for non-Python languages
-                    })
+                # Get the list of stdlib modules for the current Python version
+                stdlib_modules = set(stdlibs.module_names)
+                # stdlib_modules = {
+                #     'os', 'sys', 'json', 'time', 'datetime', 'math', 'random', 're', 'collections', 
+                #     'itertools', 'functools', 'operator', 'pathlib', 'urllib', 'http', 'logging', 
+                #     'threading', 'multiprocessing', 'asyncio', 'typing', 'dataclasses', 'enum', 
+                #     'abc', 'io', 'csv', 'sqlite3', 'pickle', 'base64', 'hashlib', 'hmac', 'secrets', 
+                #     'unittest', 'doctest', 'pdb', 'profile', 'cProfile', 'timeit'
+                # }
+                all_imports = all_imports - stdlib_modules
             
             return {
-                "imports": sorted(all_imports_with_type, key=lambda x: x['name']),
-                "language": language,
-                "path": path,
-                "count": len(all_imports_with_type)
+                "imports": sorted(list(all_imports)), "language": language,
+                "path": path, "count": len(all_imports)
             }
         
         except Exception as e:
@@ -514,11 +470,6 @@ class MCPServer:
         
         try:
             path_obj = Path(path).resolve()
-            
-            # Check if the repository is already indexed
-            indexed_repos = self.code_finder.list_indexed_repositories()
-            if str(path_obj) in [repo['path'] for repo in indexed_repos]:
-                return {"warning": f"Repository at '{path}' is already indexed. If you want to re-index, please delete it first using the 'delete_repository' tool."}
 
             if not path_obj.exists():
                 return {"error": f"Path {path} does not exist"}
@@ -553,63 +504,29 @@ class MCPServer:
         """Tool to add a Python package to Neo4j graph by auto-discovering its location"""
         package_name = args.get("package_name")
         is_dependency = args.get("is_dependency", True)
-        package_path = self.get_package_path(package_name)
-        if package_path is None:
-            return {"warning": f"'{package_name}': is either a built-in Python module or a non-installed package and cannot be added to the graph."}
-
-        # Check if a repository with this package name already exists
-        with self.db_manager.get_driver().session() as session:
-            existing_repo = session.run("MATCH (r:Repository {name: $package_name}) RETURN r.path as path", package_name=package_name).single()
-            if existing_repo:
-                return {"warning": f"Package '{package_name}' is already indexed from path '{existing_repo['path']}'. If you want to re-index, please delete it first using the 'delete_repository' tool."}
-
-        if not os.path.exists(package_path):
-            return {"error": f"Package path '{package_path}' does not exist"}
         
-        # Safety check for overly broad paths
-        normalized_package_path = os.path.normpath(package_path)
-        risky_patterns = [
-            os.path.normpath(os.path.join(sys.prefix, 'lib', f'python{sys.version_info.major}.{sys.version_info.minor}', 'site-packages')),
-            os.path.normpath(os.path.join(sys.prefix, 'lib', f'python{sys.version_info.major}.{sys.version_info.minor}')),
-            os.path.normpath(os.path.join(os.path.expanduser('~'), '.pyenv', 'versions', f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}', 'lib', f'python{sys.version_info.major}.{sys.version_info.minor}', 'site-packages')),
-            os.path.normpath(os.path.join(os.path.expanduser('~'), '.pyenv', 'versions', f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}', 'lib', f'python{sys.version_info.major}.{sys.version_info.minor}'))
-            # Add more general patterns if needed, e.g., just 'site-packages' as a substring check
-        ]
-
-        for pattern in risky_patterns:
-            if normalized_package_path == pattern:
-                return {"error": f"Package path '{package_path}' resolves to a broad Python installation directory (e.g., site-packages or standard library). Indexing such a large directory is risky and has been prevented. Please specify a more specific package or module."}
-        
-        # Additional check for standard library modules that are single files directly under lib/pythonX.Y
-        # This prevents indexing the entire stdlib if a module like 'json' is passed.
-        stdlib_dir_prefix = os.path.normpath(os.path.join(sys.prefix, 'lib', f'python{sys.version_info.major}.{sys.version_info.minor}'))
-        if normalized_package_path.startswith(stdlib_dir_prefix) and os.path.isfile(normalized_package_path):
-            # If it's a file within the stdlib, we allow it unless it's the stdlib root itself (which is caught by risky_patterns)
-            # The original intent was to prevent indexing the *entire* stdlib, not individual files.
-            pass
-        elif normalized_package_path.startswith(stdlib_dir_prefix) and not os.path.isdir(normalized_package_path):
-            # This handles cases like C extensions in stdlib that are not directories
-            pass
-        elif normalized_package_path.startswith(stdlib_dir_prefix) and normalized_package_path != stdlib_dir_prefix:
-            # If it's a subdirectory within stdlib (e.g., 'collections'), allow it.
-            pass
-        elif normalized_package_path.startswith(stdlib_dir_prefix) and normalized_package_path == stdlib_dir_prefix:
-            # This case should be caught by risky_patterns, but as a double check
-            return {"error": f"Package path '{package_path}' resolves to the entire Python standard library directory. Indexing such a large directory is risky and has been prevented. Please specify a more specific package or module."}
-        
-        try: # This is the main try block for job creation
+        try:
+            package_path = self.get_local_package_path(package_name)
+            
+            if not package_path:
+                return {"error": f"Could not find package '{package_name}'. Make sure it's installed."}
+            
+            if not os.path.exists(package_path):
+                return {"error": f"Package path '{package_path}' does not exist"}
+            
             path_obj = Path(package_path)
             
-            total_files, estimated_time = self.graph_builder.estimate_processing_time(path_obj)            
+            total_files, estimated_time = self.graph_builder.estimate_processing_time(path_obj)
+            
             job_id = self.job_manager.create_job(package_path, is_dependency)
             
             self.job_manager.update_job(job_id, total_files=total_files, estimated_duration=estimated_time)
             
-            # Create the task and let it run in the background without awaiting it here
             coro = self.graph_builder.build_graph_from_path_async(
                 path_obj, is_dependency, job_id
             )
             asyncio.run_coroutine_threadsafe(coro, self.loop)
+            
             debug_log(f"Started background job {job_id} for package: {package_name} at {package_path}, is_dependency: {is_dependency}")
             
             return {
@@ -626,7 +543,6 @@ class MCPServer:
             debug_log(f"Error creating background job for package {package_name}: {str(e)}")
             return {"error": f"Failed to start background processing for package '{package_name}': {str(e)}"}
     
-
     def check_job_status_tool(self, **args) -> Dict[str, Any]:
         """Tool to check job status"""
         job_id = args.get("job_id")
