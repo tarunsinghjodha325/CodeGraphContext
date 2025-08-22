@@ -11,7 +11,6 @@ from datetime import datetime
 from pathlib import Path
 from neo4j.exceptions import CypherSyntaxError
 from dataclasses import asdict
-from codegraphcontext.core.database import DatabaseManager
 
 from typing import Any, Dict, Coroutine, Optional
 

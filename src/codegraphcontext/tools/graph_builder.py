@@ -414,7 +414,6 @@ class GraphBuilder:
                         file_path=file_path_str, 
                         parent_name=base_class_name)
 
-            self._create_function_calls(session, file_data)
             self._create_class_method_relationships(session, file_data)
             self._create_contextual_relationships(session, file_data)
     
@@ -475,50 +474,128 @@ class GraphBuilder:
                 file_path=file_path,
                 var_name=var['name'],
                 var_line=var['line_number'])
-
+    
     def _create_function_calls(self, session, file_data: Dict):
         """Create CALLS relationships between functions based on function_calls data with improved matching"""
-        file_path = str(Path(file_data['file_path']).resolve())
+        # file_path = str(Path(file_data['file_path']).resolve())
+        caller_file_path = str(Path(file_data['file_path']).resolve())
+        def create_function_call_map(data):
+            """
+            Processes JSON data to map function calls to their file paths.
 
-        for call in file_data.get('function_calls', []):
+            Args:
+                data (dict): The parsed JSON data containing function_calls,
+                            variables, and imports.
+
+            Returns:
+                list: A list of dictionaries, where each dictionary represents a
+                    function call and includes its resolved file path.
+            """
+            function_calls = data.get("function_calls", [])
+            variables = data.get("variables", [])
+            imports = data.get("imports", [])
+            current_file_path = data.get("file_path", "unknown_file.py")
+            # Create quick lookup dictionaries for variables and imports for efficiency
+            variable_to_class = {
+                var["name"]: var["value"].split("(")[0] for var in variables
+            }
+
+            class_to_path = {}
+            for imp in imports:
+                # Assumes the last part of the import name is the class name
+                parts = imp["name"].split(".")
+                class_name = parts[-1]
+                # Convert module path to file path
+                file_path = "/".join(parts[:-1]) + ".py"
+                # class_to_path[class_name] = str(Path(file_path).resolve())
+                class_to_path[class_name] = str(os.path.join(
+                    os.path.dirname(current_file_path), file_path
+                ))
+
+            # Process each function call to add the file path
+            mapped_calls = []
+            for call in function_calls:
+                full_name = call.get("full_name", "")
+                
+                # Default path is the current file if it's a simple function call
+                call['file_path'] = str(Path(data.get("file_path", "unknown_file.py")).resolve())
+
+                if "." in full_name:
+                    # Handle method calls like 'self.code_finder.analyze_code_relationships'
+                    parts = full_name.split(".")
+                    # The variable is typically the second to last part
+                    variable_name = parts[-2] if len(parts) > 1 else parts[0]
+
+                    # Find the class of the variable
+                    class_name = variable_to_class.get(variable_name)
+
+                    if class_name:
+                        # Find the file path for that class
+                        path = class_to_path.get(class_name)
+                        if path:
+                            call['file_path'] = path
+                
+                mapped_calls.append(call)
+
+            return mapped_calls
+
+        file_added_function_calls = create_function_call_map(file_data)
+        if 'server.py' in file_data.get('file_path', ''):
+
+            logger.info(f"Processing function calls for {file_data.get('file_path')}")
+            with open("parsed_data.json", "w", encoding="utf-8") as f:
+                import json
+                json.dump(file_added_function_calls, f, indent=4, ensure_ascii=False)
+        for call in file_added_function_calls:
             caller_context = call.get('context')
             called_name = call['name']
             full_call_name = call.get('full_name', called_name)
             line_number = call['line_number']
-            
+            called_file_path = call['file_path']
             if called_name in ['print', 'len', 'str', 'int', 'float', 'list', 'dict', 'set', 'tuple']:
                 continue
-                
+            debug_log(f"Processing call: {caller_context} @ {caller_file_path} calls {called_name} @ {called_file_path}")    
             if caller_context:
                 session.run("""
-                    MATCH (caller:Function {name: $caller_name, file_path: $file_path})
-                    MATCH (called:Function {name: $called_name})
+                    // Match the caller using ITS OWN file path
+                    MATCH (caller:Function {name: $caller_name, file_path: $caller_file_path})
+                    
+                    // Match the called function using the path we resolved
+                    MATCH (called:Function {name: $called_name, file_path: $called_file_path})
+
                     MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(called)
                 """, 
                 caller_name=caller_context,
-                file_path=file_path,
+                caller_file_path=caller_file_path, # Pass the correct path for the caller
                 called_name=called_name,
-                line_number=line_number,
+                called_file_path=called_file_path, # Pass the path for the called function
+                line_number=call['line_number'],
                 args=call.get('args', []),
-                full_call_name=full_call_name)
+                full_call_name=call.get('full_name', called_name))
                 
-                if '.' in full_call_name:
-                    parts = full_call_name.split('.')
-                    if len(parts) >= 2:
-                        method_name = parts[-1]
+                # if '.' in full_call_name:
+                #     parts = full_call_name.split('.')
+                #     if len(parts) >= 2:
+                #         method_name = parts[-1]
                         
-                        session.run("""
-                            MATCH (caller:Function {name: $caller_name, file_path: $file_path})
-                            MATCH (called:Function {name: $method_name})
-                            WHERE called.name = $method_name
-                            MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name, call_type: 'method'}]->(called)
-                        """, 
-                        caller_name=caller_context,
-                        file_path=file_path,
-                        method_name=method_name,
-                        line_number=line_number,
-                        args=call.get('args', []),
-                        full_call_name=full_call_name)
+                #         session.run("""
+                #             MATCH (caller:Function {name: $caller_name, file_path: $file_path})
+                #             MATCH (called:Function {name: $method_name})
+                #             WHERE called.name = $method_name
+                #             MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name, call_type: 'method'}]->(called)
+                #         """, 
+                #         caller_name=caller_context,
+                #         file_path=file_path,
+                #         method_name=method_name,
+                #         line_number=line_number,
+                #         args=call.get('args', []),
+                #         full_call_name=full_call_name)
+
+    def _create_all_function_calls(self, all_file_data: list[Dict]):
+        """Create CALLS relationships for all functions after all files have been processed."""
+        with self.driver.session() as session:
+            for file_data in all_file_data:
+                self._create_function_calls(session, file_data)
     
     def _create_class_method_relationships(self, session, file_data: Dict):
         """Create CONTAINS relationships from classes to their methods"""
@@ -657,6 +734,8 @@ class GraphBuilder:
             files = list(path.rglob("*.py")) if path.is_dir() else [path]
             if job_id:
                 self.job_manager.update_job(job_id, total_files=len(files))
+            
+            all_function_calls_data = [] # Initialize list to collect all function call data
 
             processed_count = 0
             for file in files:
@@ -666,10 +745,14 @@ class GraphBuilder:
                     file_data = self.parse_python_file(file, is_dependency)
                     if "error" not in file_data:
                         self.add_file_to_graph(file_data, repo_name)
+                        all_function_calls_data.append(file_data) # Collect for later processing
                     processed_count += 1
                     if job_id:
                         self.job_manager.update_job(job_id, processed_files=processed_count)
                     await asyncio.sleep(0.01)
+            
+            # After all files are processed, create function call relationships
+            self._create_all_function_calls(all_function_calls_data)
 
             if job_id:
                 self.job_manager.update_job(job_id, status=JobStatus.COMPLETED, end_time=datetime.now())
@@ -722,11 +805,11 @@ class GraphBuilder:
                 "error": f"Failed to start background processing: {e.__class__.__name__}: {e}"
             }
 
-    def add_package_to_graph_tool(
-        self, package_name: str, is_dependency: bool = True
-    ) -> Dict[str, Any]:
-        """Tool to add a Python package to Neo4j graph"""
-        package_path = self.get_local_package_path(package_name)
-        if not package_path:
-            return {"error": f"Could not find package '{package_name}'."}
-        return self.add_code_to_graph_tool(path=package_path, is_dependency=is_dependency)
+    # def add_package_to_graph_tool(
+    #     self, package_name: str, is_dependency: bool = True
+    # ) -> Dict[str, Any]:
+    #     """Tool to add a Python package to Neo4j graph"""
+    #     package_path = self.get_local_package_path(package_name)
+    #     if not package_path:
+    #         return {"error": f"Could not find package '{package_name}'."}
+    #     return self.add_code_to_graph_tool(path=package_path, is_dependency=is_dependency)
