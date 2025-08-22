@@ -126,7 +126,20 @@ class CodeVisitor(ast.NodeVisitor):
         """Visit function definitions"""
         complexity_visitor = CyclomaticComplexityVisitor()
         complexity_visitor.visit(node)
-        
+        # Capture function parameters with their type annotations as variables
+        for arg in node.args.args:
+            # Check if the parameter has a type annotation
+            if arg.annotation:
+                var_data = {
+                    "name": arg.arg,
+                    "line_number": node.lineno,
+                    "value": ast.unparse(arg.annotation) if hasattr(ast, "unparse") else "",
+                    "context": node.name,
+                    "class_context": self.current_class,
+                    "is_dependency": self.is_dependency,
+                    "parent_line": node.lineno,
+                }
+                self.variables.append(var_data)
         func_data = {
             "name": node.name,
             "line_number": node.lineno,
@@ -239,17 +252,28 @@ class CodeVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_ImportFrom(self, node):
-        """Visit from-import statements"""
-        for name in node.names:
+        """
+        Visit from-import statements, now correctly capturing the relative path.
+        """
+        # Create the relative path prefix (e.g., '.', '..') based on the level.
+        prefix = '.' * node.level
+
+        for alias in node.names:
+            # If node.module is None, it's an import like `from . import name`
+            if node.module:
+                full_name = f"{prefix}{node.module}.{alias.name}"
+            else:
+                # The full name is just the prefix and the imported name
+                full_name = f"{prefix}{alias.name}"
+
             import_data = {
-                "name": f"{node.module}.{name.name}" if node.module else name.name,
+                "name": full_name,
                 "line_number": node.lineno,
-                "alias": name.asname,
+                "alias": alias.asname,
                 "context": self.current_context,
                 "is_dependency": self.is_dependency,
             }
             self.imports.append(import_data)
-        self.generic_visit(node)
 
     def visit_Call(self, node):
         """Visit function calls with enhanced detection"""
@@ -477,7 +501,6 @@ class GraphBuilder:
     
     def _create_function_calls(self, session, file_data: Dict):
         """Create CALLS relationships between functions based on function_calls data with improved matching"""
-        # file_path = str(Path(file_data['file_path']).resolve())
         caller_file_path = str(Path(file_data['file_path']).resolve())
         def create_function_call_map(data):
             """
@@ -502,16 +525,17 @@ class GraphBuilder:
 
             class_to_path = {}
             for imp in imports:
-                # Assumes the last part of the import name is the class name
-                parts = imp["name"].split(".")
+                imp_name = imp["name"]
+                levels = len(imp_name) - len(imp_name.lstrip('.'))  # count dots
+                parts = imp_name.lstrip('.').split(".")
                 class_name = parts[-1]
-                # Convert module path to file path
-                file_path = "/".join(parts[:-1]) + ".py"
-                # class_to_path[class_name] = str(Path(file_path).resolve())
-                class_to_path[class_name] = str(os.path.join(
-                    os.path.dirname(current_file_path), file_path
-                ))
 
+                # climb up (levels - 1) directories
+                base_dir = Path(current_file_path).parent
+                for _ in range(levels - 1):
+                    base_dir = base_dir.parent
+
+                class_to_path[class_name] = str(base_dir.joinpath(*parts[:-1]).with_suffix(".py"))
             # Process each function call to add the file path
             mapped_calls = []
             for call in function_calls:
@@ -533,24 +557,16 @@ class GraphBuilder:
                         # Find the file path for that class
                         path = class_to_path.get(class_name)
                         if path:
-                            call['file_path'] = path
+                            call['file_path'] = str(path)
                 
                 mapped_calls.append(call)
 
             return mapped_calls
-
+        
         file_added_function_calls = create_function_call_map(file_data)
-        if 'server.py' in file_data.get('file_path', ''):
-
-            logger.info(f"Processing function calls for {file_data.get('file_path')}")
-            with open("parsed_data.json", "w", encoding="utf-8") as f:
-                import json
-                json.dump(file_added_function_calls, f, indent=4, ensure_ascii=False)
         for call in file_added_function_calls:
             caller_context = call.get('context')
             called_name = call['name']
-            full_call_name = call.get('full_name', called_name)
-            line_number = call['line_number']
             called_file_path = call['file_path']
             if called_name in ['print', 'len', 'str', 'int', 'float', 'list', 'dict', 'set', 'tuple']:
                 continue
@@ -573,24 +589,6 @@ class GraphBuilder:
                 args=call.get('args', []),
                 full_call_name=call.get('full_name', called_name))
                 
-                # if '.' in full_call_name:
-                #     parts = full_call_name.split('.')
-                #     if len(parts) >= 2:
-                #         method_name = parts[-1]
-                        
-                #         session.run("""
-                #             MATCH (caller:Function {name: $caller_name, file_path: $file_path})
-                #             MATCH (called:Function {name: $method_name})
-                #             WHERE called.name = $method_name
-                #             MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name, call_type: 'method'}]->(called)
-                #         """, 
-                #         caller_name=caller_context,
-                #         file_path=file_path,
-                #         method_name=method_name,
-                #         line_number=line_number,
-                #         args=call.get('args', []),
-                #         full_call_name=full_call_name)
-
     def _create_all_function_calls(self, all_file_data: list[Dict]):
         """Create CALLS relationships for all functions after all files have been processed."""
         with self.driver.session() as session:
@@ -750,7 +748,7 @@ class GraphBuilder:
                     if job_id:
                         self.job_manager.update_job(job_id, processed_files=processed_count)
                     await asyncio.sleep(0.01)
-            
+
             # After all files are processed, create function call relationships
             self._create_all_function_calls(all_function_calls_data)
 
@@ -804,12 +802,3 @@ class GraphBuilder:
             return {
                 "error": f"Failed to start background processing: {e.__class__.__name__}: {e}"
             }
-
-    # def add_package_to_graph_tool(
-    #     self, package_name: str, is_dependency: bool = True
-    # ) -> Dict[str, Any]:
-    #     """Tool to add a Python package to Neo4j graph"""
-    #     package_path = self.get_local_package_path(package_name)
-    #     if not package_path:
-    #         return {"error": f"Could not find package '{package_name}'."}
-    #     return self.add_code_to_graph_tool(path=package_path, is_dependency=is_dependency)
