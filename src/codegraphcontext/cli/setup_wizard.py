@@ -101,7 +101,7 @@ def run_setup_wizard():
     questions = [
         {
             "type": "list",
-            "message": "Where is your Neo4j database located?",
+            "message": "Where is your Neo4j database located? We can help you get one, if you don't have.",
             "choices": [
                 "Local (Recommended: I'll help you run it on this machine)",
                 "Hosted (Connect to a remote database like AuraDB)",
